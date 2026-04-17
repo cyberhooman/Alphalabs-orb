@@ -56,8 +56,11 @@ FUNDED_PARAMS = dict(
 IVB_DEFAULTS = dict(
     ib_minutes       = 60,     # Initial Balance window (15, 30, or 60 min)
     bar_minutes      = 1,      # must match data_gen bar_minutes
-    delta_threshold  = 0.40,   # strong-delta confirmation (0=any, 0.4=selective)
+    delta_threshold  = 0.35,   # strong-delta confirmation; lowered from 0.40 to
+                               # capture more regime sessions after IB-bias fix
     rr_ratio         = 1.0,    # reward:risk (1.0 = 1:1)
+    min_ib_range     = 12.0,   # skip sessions with tiny IB (choppy, no structure)
+    vol_confirm_mult = 1.2,    # breakout bar volume must exceed this × avg IB vol
 )
 
 
@@ -220,9 +223,11 @@ def run_backtest(
 
     delta_arr = _delta_ratio(highs, lows, closes)
 
-    ib_bars   = p["ib_minutes"] // p["bar_minutes"]
-    rr        = p["rr_ratio"]
-    delta_thr = p["delta_threshold"]
+    ib_bars       = p["ib_minutes"] // p["bar_minutes"]
+    rr            = p["rr_ratio"]
+    delta_thr     = p["delta_threshold"]
+    min_ib_range  = p.get("min_ib_range", 0.0)
+    vol_mult      = p.get("vol_confirm_mult", 0.0)
 
     risk      = _FundedRisk(funded_params) if funded_params else None
     start_eq  = (funded_params["account_size"]
@@ -238,6 +243,7 @@ def run_backtest(
     ib_highs_list: List[float] = []
     ib_lows_list : List[float] = []
     ib_vols_list : List[float] = []
+    avg_ib_vol   = 0.0
     poc = vah = val = np.nan
     day_bar     = 0
     trade_today = False
@@ -270,6 +276,7 @@ def run_backtest(
             ib_highs_list.clear()
             ib_lows_list.clear()
             ib_vols_list.clear()
+            avg_ib_vol  = 0.0
             poc = vah = val = np.nan
             day_bar     = 0
             trade_today = False
@@ -294,6 +301,7 @@ def run_backtest(
                 np.array(ib_lows_list),
                 np.array(ib_vols_list),
             )
+            avg_ib_vol = float(np.mean(ib_vols_list)) if ib_vols_list else 0.0
 
         day_bar += 1
 
@@ -349,7 +357,13 @@ def run_backtest(
             dr = delta_arr[i]       # delta ratio for this bar
             ib_range = ib_high - ib_low
 
-            if ib_range > 0:
+            # Skip sessions with a tiny IB (low-conviction, noise-dominated)
+            # and require the breakout bar to show above-average volume
+            # (proxy for institutional participation on the signal bar).
+            vol_ok = (avg_ib_vol == 0.0
+                      or volume_arr[i] >= avg_ib_vol * vol_mult)
+
+            if ib_range >= min_ib_range and vol_ok:
                 if c > ib_high and dr > delta_thr:
                     # Long: stop at IB_Low (opposite end), target 1:n
                     stop   = ib_low

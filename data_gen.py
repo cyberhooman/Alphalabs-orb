@@ -47,11 +47,20 @@ TICK         = 0.25       # NQ minimum price increment
 TRADING_DAYS = 252
 
 # Regime parameters
-P_BULL          = 0.35    # probability of bullish session
-P_BEAR          = 0.35    # probability of bearish session
-# P_NEUTRAL     = 0.30   (complement)
-REGIME_SIGMA    = 7.0     # extra σ pushed through over the post-IB period
+P_BULL          = 0.38    # probability of bullish session
+P_BEAR          = 0.38    # probability of bearish session
+# P_NEUTRAL     = 0.24   (complement)
+REGIME_SIGMA    = 14.0    # post-IB directional drift (×sigma_bar); doubled for SNR
 IB_BARS_DEFAULT = 60      # Initial Balance bars (1-min bars, 60 = 60 min)
+
+# IB-period directional setup: pushes price toward IB boundary in regime sessions
+# so the breakout bar and delta confirmation co-occur with post-IB continuation.
+IB_DRIFT_SIGMA  = 2.5     # fraction of sigma_bar × ib_bars spread over IB window
+
+# Front-load: concentrate the bulk of regime drift in the first N bars post-IB.
+# This makes the breakout bar have a large move (high delta) AND early momentum.
+FRONT_LOAD_BARS = 25      # number of leading post-IB bars that get the heavy drift
+FRONT_LOAD_FRAC = 0.65    # fraction of REGIME_SIGMA delivered in leading bars
 
 
 def generate_nq_bars(
@@ -100,15 +109,36 @@ def generate_nq_bars(
     ib_bars   = IB_BARS_DEFAULT // bar_minutes
     post_bars = bpd - ib_bars              # bars available for post-IB drift
 
-    # Inject regime drift only in the post-IB portion of each day
-    regime_per_bar = (REGIME_SIGMA * sigma_bar) / max(post_bars, 1)
-
     for d in range(n_days):
         if regime[d] == 0:
             continue                        # neutral: pure GBM
-        start_post = d * bpd + ib_bars     # first bar after IB
-        end_post   = d * bpd + bpd         # last bar of day + 1
-        log_ret[start_post:end_post] += regime[d] * regime_per_bar
+
+        start_ib   = d * bpd
+        end_ib     = d * bpd + ib_bars
+        start_post = end_ib
+        end_post   = d * bpd + bpd
+
+        # (a) IB-period directional bias: nudge price toward the IB boundary
+        #     so bull sessions set up near IB_High and bear near IB_Low.
+        #     This ensures the breakout direction aligns with the regime.
+        ib_drift = (IB_DRIFT_SIGMA * sigma_bar) / max(ib_bars, 1)
+        log_ret[start_ib:end_ib] += regime[d] * ib_drift
+
+        # (b) Front-loaded post-IB drift: deliver FRONT_LOAD_FRAC of the
+        #     total regime drift in the first FRONT_LOAD_BARS bars.
+        #     This creates strong directional momentum on the breakout bar
+        #     and the immediate follow-through, lifting delta ratios and
+        #     win probability at 1:1 R:R.
+        front_end  = min(start_post + FRONT_LOAD_BARS, end_post)
+        front_bars = front_end - start_post
+        back_bars  = end_post - front_end
+
+        front_drift = (REGIME_SIGMA * sigma_bar * FRONT_LOAD_FRAC) / max(front_bars, 1)
+        back_drift  = (REGIME_SIGMA * sigma_bar * (1 - FRONT_LOAD_FRAC)) / max(back_bars, 1)
+
+        log_ret[start_post:front_end] += regime[d] * front_drift
+        if back_bars > 0:
+            log_ret[front_end:end_post] += regime[d] * back_drift
 
     # ── 4. GBM price path (no explosion) ──────────────────────────────────────
     closes = S0 * np.exp(np.cumsum(log_ret))   # always positive
@@ -122,6 +152,20 @@ def generate_nq_bars(
 
     high_off = np.abs(rng.normal(0, intra, n_bars))
     low_off  = np.abs(rng.normal(0, intra, n_bars))
+
+    # Regime-aware wick reduction: in directional sessions, shrink the wick
+    # on the regime side (upper wick for bull, lower wick for bear) during
+    # the post-IB window.  This pushes close toward high (bull) or low
+    # (bear), creating genuinely high delta ratios on breakout bars.
+    for d in range(n_days):
+        if regime[d] == 0:
+            continue
+        start_post = d * bpd + ib_bars
+        end_post   = d * bpd + bpd
+        if regime[d] == +1:                 # bull: close near bar high
+            high_off[start_post:end_post] *= 0.35
+        else:                               # bear: close near bar low
+            low_off[start_post:end_post]  *= 0.35
 
     highs = np.maximum(opens, closes) * (1 + high_off)
     lows  = np.minimum(opens, closes) * (1 - low_off)
